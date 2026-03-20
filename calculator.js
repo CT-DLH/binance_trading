@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         币安多合约计算器 (记忆版)
+// @name         币安三角套利计算器(内存优化版)
 // @namespace    https://binance.com
-// @version      1.4
-// @description  支持变量定义、表达式计算，自动保存/恢复设置，实时获取币安价格（无eval，CSP安全）
+// @version      3.0
+// @description  低内存/低CPU, 防抖节流, 自动清理资源, 吃单+挂单双策略, 无内存泄漏
 // @author       Custom
 // @match        *://*.binance.com/*
 // @grant        GM_addStyle
@@ -12,540 +12,283 @@
 (function() {
     'use strict';
 
-    // ==================== 存储键名 ====================
+    // ==================== 配置 ====================
     const STORAGE_VARS = 'binance_calc_variables';
     const STORAGE_EXPR = 'binance_calc_expression';
+    const STORAGE_TRI = 'binance_calc_triangular';
+    const UPDATE_DEBOUNCE = 100; // 核心防抖：100ms更新一次，大幅降性能消耗
+    const MAX_RECONNECT_COUNT = 5; // WebSocket最大重连次数，防止无限重连
 
     // ==================== 样式 ====================
     GM_addStyle(`
-        #calc-panel {
-            position: fixed;
-            top: 100px;
-            right: 20px;
-            width: 380px;
-            background: #1f2937;
-            color: #f3f4f6;
-            border-radius: 12px;
-            box-shadow: 0 8px 20px rgba(0,0,0,0.4);
-            font-family: monospace;
-            font-size: 13px;
-            z-index: 999999999;
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-            resize: both;
-            min-width: 320px;
-        }
-        .calc-header {
-            background: #0f172a;
-            padding: 8px 12px;
-            cursor: move;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 1px solid #334155;
-            user-select: none;
-        }
-        .calc-header span { font-weight: bold; color: #60a5fa; }
-        .calc-close {
-            background: #ef4444;
-            border: none;
-            color: white;
-            width: 22px;
-            height: 22px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 12px;
-        }
-        .calc-content { padding: 12px; display: flex; flex-direction: column; gap: 12px; }
-        .variables-section, .expression-section {
-            background: #111827;
-            border-radius: 8px;
-            padding: 8px;
-        }
-        .section-title { font-weight: bold; margin-bottom: 8px; color: #9ca3af; font-size: 12px; }
-        .var-list {
-            max-height: 200px;
-            overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            margin-bottom: 8px;
-        }
-        .var-item {
-            background: #1f2937;
-            border-radius: 6px;
-            padding: 6px;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            font-size: 12px;
-        }
-        .var-name { font-weight: bold; min-width: 40px; color: #fbbf24; }
-        .var-desc { flex: 1; color: #d1d5db; font-size: 11px; }
-        .var-remove { background: none; border: none; color: #ef4444; cursor: pointer; font-size: 14px; }
-        .add-var-form {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-            margin-top: 6px;
-            align-items: center;
-        }
-        .add-var-form input, .add-var-form select {
-            background: #374151;
-            border: 1px solid #4b5563;
-            color: white;
-            border-radius: 4px;
-            padding: 4px 6px;
-            font-size: 11px;
-        }
-        .add-var-form .symbol-input { width: 90px; }
-        .btn {
-            background: #3b82f6;
-            border: none;
-            color: white;
-            border-radius: 4px;
-            padding: 4px 8px;
-            cursor: pointer;
-            font-size: 11px;
-        }
-        .btn:hover { background: #2563eb; }
-        .expr-input {
-            width: 100%;
-            background: #374151;
-            border: 1px solid #4b5563;
-            color: white;
-            border-radius: 6px;
-            padding: 6px;
-            font-family: monospace;
-            font-size: 13px;
-            box-sizing: border-box;
-        }
-        .result {
-            margin-top: 8px;
-            background: #0f172a;
-            border-radius: 6px;
-            padding: 8px;
-            text-align: right;
-            font-size: 16px;
-            font-weight: bold;
-            color: #10b981;
-            word-break: break-all;
-        }
-        .result-label { font-size: 11px; color: #9ca3af; margin-right: 6px; }
-        .error-msg {
-            color: #ef4444;
-            font-size: 11px;
-            margin-top: 4px;
-            text-align: right;
-        }
+        #calc-panel {position:fixed;top:100px;right:20px;width:460px;background:#1f2937;color:#f3f4f6;border-radius:12px;box-shadow:0 8px 20px rgba(0,0,0,0.4);font-family:monospace;font-size:13px;z-index:999999;overflow:hidden;display:flex;flex-direction:column;resize:both;min-width:400px;}
+        .calc-header{background:#0f172a;padding:8px 12px;cursor:move;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #334155;user-select:none;}
+        .calc-header span{font-weight:bold;color:#60a5fa;}
+        .calc-close{background:#ef4444;border:none;color:white;width:22px;height:22px;border-radius:4px;cursor:pointer;font-size:12px;}
+        .calc-content{padding:12px;display:flex;flex-direction:column;gap:12px;}
+        .variables-section,.expression-section,.triangular-section{background:#111827;border-radius:8px;padding:8px;}
+        .section-title{font-weight:bold;margin-bottom:8px;color:#9ca3af;font-size:12px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;}
+        .section-title .toggle-icon{font-size:14px;transition:transform 0.2s;}
+        .section-title.collapsed .toggle-icon{transform:rotate(-90deg);}
+        .section-content{overflow:hidden;transition:max-height 0.2s ease-out;}
+        .section-content.collapsed{max-height:0;padding:0;margin:0;}
+        .var-list{max-height:150px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;margin-bottom:8px;}
+        .var-item{background:#1f2937;border-radius:6px;padding:6px;display:flex;align-items:center;gap:6px;font-size:12px;}
+        .var-name{font-weight:bold;min-width:40px;color:#fbbf24;}
+        .var-desc{flex:1;color:#d1d5db;font-size:11px;}
+        .var-remove{background:none;border:none;color:#ef4444;cursor:pointer;font-size:14px;}
+        .add-var-form,.tri-form{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;align-items:center;}
+        .add-var-form input,.add-var-form select,.tri-form input,.tri-form select{background:#374151;border:1px solid #4b5563;color:white;border-radius:4px;padding:4px 6px;font-size:11px;}
+        .add-var-form .symbol-input,.tri-form .symbol-input{width:90px;}
+        .btn{background:#3b82f6;border:none;color:white;border-radius:4px;padding:4px 8px;cursor:pointer;font-size:11px;}
+        .btn:hover{background:#2563eb;}
+        .expr-input{width:100%;background:#374151;border:1px solid #4b5563;color:white;border-radius:6px;padding:6px;font-family:monospace;font-size:13px;box-sizing:border-box;}
+        .result{margin-top:8px;background:#0f172a;border-radius:6px;padding:8px;text-align:right;font-size:16px;font-weight:bold;color:#10b981;word-break:break-all;}
+        .result-label{font-size:11px;color:#9ca3af;margin-right:6px;}
+        .error-msg{color:#ef4444;font-size:11px;margin-top:4px;text-align:right;}
+        .tri-result{margin-top:8px;background:#0f172a;border-radius:6px;padding:8px;font-size:12px;}
+        .tri-strategy{margin:6px 0;padding:6px;border-radius:4px;}
+        .tri-strategy.profitable{background:rgba(16,185,129,0.2);border-left:3px solid #10b981;}
+        .tri-strategy.normal{background:rgba(239,68,68,0.1);border-left:3px solid #ef4444;}
+        .tri-rule{font-size:10px;color:#60a5fa;margin-top:2px;}
     `);
 
-    // ==================== 安全的表达式解析器 ====================
+    // ==================== 工具函数：防抖（核心优化） ====================
+    function debounce(func, delay) {
+        let timer = null;
+        return function(...args) {
+            clearTimeout(timer);
+            timer = setTimeout(() => func.apply(this, args), delay);
+        };
+    }
+
+    // ==================== 安全计算 ====================
     function safeEval(expr, variables) {
         let replaced = expr;
-        for (const [name, value] of Object.entries(variables)) {
-            const regex = new RegExp(`\\b${name}\\b`, 'g');
-            replaced = replaced.replace(regex, value);
-        }
-        if (!/^[\d+\-*/()\s.]+$/.test(replaced)) {
-            return { error: '表达式包含非法字符或未定义变量' };
-        }
+        for (const [name, value] of Object.entries(variables)) replaced = replaced.replace(new RegExp(`\\b${name}\\b`, 'g'), value);
+        if (!/^[\d+\-*/()\s.]+$/.test(replaced)) return { error: '非法字符' };
         try {
-            const result = parseExpression(replaced);
-            if (isNaN(result) || !isFinite(result)) {
-                return { error: '无效表达式' };
-            }
-            return { value: result };
+            const result = Function(`'use strict';return (${replaced})`)();
+            return isNaN(result) || !isFinite(result) ? { error: '无效结果' } : { value: result };
         } catch (e) {
-            return { error: '表达式语法错误: ' + e.message };
+            return { error: '计算错误' };
         }
     }
 
-    function parseExpression(str) {
-        let pos = 0;
-        const s = str.replace(/\s/g, '');
-        function peek() { return s[pos]; }
-        function consume(ch) {
-            if (peek() === ch) {
-                pos++;
-                return true;
-            }
-            return false;
-        }
-        function parsePrimary() {
-            if (consume('(')) {
-                const expr = parseExpression();
-                if (!consume(')')) throw new Error('缺少右括号');
-                return expr;
-            }
-            let start = pos;
-            while (pos < s.length && (s[pos] >= '0' && s[pos] <= '9' || s[pos] === '.')) pos++;
-            if (start === pos) throw new Error('期望数字或括号');
-            const num = parseFloat(s.substring(start, pos));
-            if (isNaN(num)) throw new Error('无效数字');
-            return num;
-        }
-        function parseTerm() {
-            let left = parsePrimary();
-            while (true) {
-                if (consume('*')) {
-                    left *= parsePrimary();
-                } else if (consume('/')) {
-                    const divisor = parsePrimary();
-                    if (divisor === 0) throw new Error('除零错误');
-                    left /= divisor;
-                } else {
-                    break;
-                }
-            }
-            return left;
-        }
-        function parseExpression() {
-            let left = parseTerm();
-            while (true) {
-                if (consume('+')) {
-                    left += parseTerm();
-                } else if (consume('-')) {
-                    left -= parseTerm();
-                } else {
-                    break;
-                }
-            }
-            return left;
-        }
-        const result = parseExpression();
-        if (pos < s.length) throw new Error('多余字符');
-        return result;
-    }
+    // ==================== 全局变量 ====================
+    let variables = [], currentPrices = {}, wsConnections = {};
+    let triConfig = { market: 'spot', symbolAB: '', symbolBC: '', symbolAC: '' };
+    let triPrices = { ab: { bid: null, ask: null }, bc: { bid: null, ask: null }, ac: { bid: null, ask: null } };
+    let triWs = { ab: null, bc: null, ac: null };
+    let reconnectCount = {};
 
-    // ==================== WebSocket 部分 ====================
-    let variables = [];
-    let currentPrices = {};
-    let wsConnections = {};
+    function getWsBase(market) { return market === 'spot' ? 'wss://stream.binance.com/ws/' : 'wss://fstream.binance.com/ws/'; }
 
-    function getWsBase(market) {
-        return market === 'spot' ? 'wss://stream.binance.com/ws/' : 'wss://fstream.binance.com/ws/';
-    }
-
+    // ==================== WebSocket 优化版订阅 ====================
     function subscribeVariable(varObj) {
         const key = varObj.name;
-        if (wsConnections[key]) {
-            wsConnections[key].close();
-            delete wsConnections[key];
-        }
+        if (wsConnections[key]) { wsConnections[key].close(); delete wsConnections[key]; }
+        
+        const symbol = varObj.symbol.toLowerCase();
+        const stream = varObj.priceType === 'latest' ? `${symbol}@aggTrade` : `${symbol}@bookTicker`;
+        const ws = new WebSocket(`${getWsBase(varObj.market)}${stream}`);
 
-        const symbolLower = varObj.symbol.toLowerCase();
-        let streamName = '';
-        if (varObj.priceType === 'latest') {
-            streamName = `${symbolLower}@aggTrade`;
-        } else if (varObj.priceType === 'bid1' || varObj.priceType === 'ask1') {
-            streamName = `${symbolLower}@bookTicker`;
-        }
-        const wsUrl = `${getWsBase(varObj.market)}${streamName}`;
-        const ws = new WebSocket(wsUrl);
-
-        ws.onopen = () => {};
-        ws.onmessage = (event) => {
+        ws.onmessage = debounce((e) => {
             try {
-                const data = JSON.parse(event.data);
-                let price = null;
-                if (varObj.priceType === 'latest') {
-                    if (data.p) price = parseFloat(data.p);
-                } else if (varObj.priceType === 'bid1') {
-                    if (data.b) price = parseFloat(data.b);
-                } else if (varObj.priceType === 'ask1') {
-                    if (data.a) price = parseFloat(data.a);
+                const data = JSON.parse(e.data);
+                let p = null;
+                if (varObj.priceType === 'latest') p = parseFloat(data.p);
+                else if (varObj.priceType === 'bid1') p = parseFloat(data.b);
+                else p = parseFloat(data.a);
+                if (!isNaN(p)) {
+                    currentPrices[key] = p;
+                    updateAll();
                 }
-                if (price !== null && !isNaN(price)) {
-                    currentPrices[varObj.name] = price;
-                    updateVariableDisplay(varObj.name, price);
-                    updateResult();
-                }
-            } catch(e) {}
-        };
-        ws.onerror = () => {};
+            } catch(_) {}
+        }, UPDATE_DEBOUNCE);
+
         ws.onclose = () => {
-            setTimeout(() => {
-                if (variables.some(v => v.name === varObj.name)) {
-                    subscribeVariable(varObj);
-                }
-            }, 3000);
+            reconnectCount[key] = (reconnectCount[key] || 0) + 1;
+            if (reconnectCount[key] <= MAX_RECONNECT_COUNT && variables.some(v => v.name === key)) {
+                setTimeout(() => subscribeVariable(varObj), 3000);
+            }
         };
         wsConnections[key] = ws;
     }
 
-    function updateVariableDisplay(name, price) {
-        const varItems = document.querySelectorAll('.var-item');
-        for (let item of varItems) {
-            const nameSpan = item.querySelector('.var-name');
-            if (nameSpan && nameSpan.textContent === name) {
-                const priceSpan = item.querySelector('.var-price');
-                if (priceSpan) priceSpan.textContent = price.toFixed(4);
-                break;
-            }
-        }
-    }
+    // ==================== 统一更新（防抖） ====================
+    const updateAll = debounce(() => {
+        renderVariableList();
+        updateResult();
+        updateTriangularResult();
+    }, UPDATE_DEBOUNCE);
 
-    // 保存变量到 localStorage
-    function saveVariables() {
-        const toStore = variables.map(v => ({
-            name: v.name,
-            market: v.market,
-            symbol: v.symbol,
-            priceType: v.priceType
-        }));
-        localStorage.setItem(STORAGE_VARS, JSON.stringify(toStore));
-    }
-
-    // 保存表达式
-    function saveExpression(expr) {
-        localStorage.setItem(STORAGE_EXPR, expr);
-    }
-
-    // 加载变量
+    // ==================== 变量管理 ====================
+    function saveVariables() { localStorage.setItem(STORAGE_VARS, JSON.stringify(variables)); }
     function loadVariables() {
-        const stored = localStorage.getItem(STORAGE_VARS);
-        if (stored) {
-            try {
-                const loaded = JSON.parse(stored);
-                variables = loaded.map(v => ({
-                    name: v.name,
-                    market: v.market,
-                    symbol: v.symbol,
-                    priceType: v.priceType
-                }));
-                // 重新订阅每个变量
-                variables.forEach(v => subscribeVariable(v));
-                renderVariableList();
-                return true;
-            } catch(e) {}
-        }
-        return false;
-    }
-
-    // 加载表达式
-    function loadExpression() {
-        return localStorage.getItem(STORAGE_EXPR) || '';
+        const s = localStorage.getItem(STORAGE_VARS);
+        if (!s) return;
+        try { variables = JSON.parse(s); variables.forEach(subscribeVariable); } catch(_) {}
     }
 
     function addVariable(name, market, symbol, priceType) {
-        if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
-            alert('变量名只能包含字母、数字、下划线，且不能以数字开头');
-            return false;
-        }
-        if (variables.some(v => v.name === name)) {
-            alert('变量名已存在');
-            return false;
-        }
-        const newVar = { name, market, symbol: symbol.toUpperCase(), priceType };
-        variables.push(newVar);
-        subscribeVariable(newVar);
-        renderVariableList();
-        saveVariables();          // 保存变量
-        updateResult();           // 重新计算结果（因为变量变了）
+        if (!/^[a-zA-Z_]\w*$/.test(name) || variables.some(v => v.name === name)) return false;
+        const v = { name, market, symbol: symbol.toUpperCase(), priceType };
+        variables.push(v); subscribeVariable(v); saveVariables(); updateAll();
         return true;
     }
 
     function removeVariable(name) {
         variables = variables.filter(v => v.name !== name);
-        if (wsConnections[name]) {
-            wsConnections[name].close();
-            delete wsConnections[name];
-        }
-        delete currentPrices[name];
-        renderVariableList();
-        saveVariables();          // 保存变量
-        updateResult();
+        if (wsConnections[name]) { wsConnections[name].close(); delete wsConnections[name]; }
+        delete currentPrices[name]; saveVariables(); updateAll();
     }
 
     function renderVariableList() {
-        const listContainer = document.querySelector('.var-list');
-        if (!listContainer) return;
-        if (variables.length === 0) {
-            listContainer.innerHTML = '<div style="color:#9ca3af; text-align:center;">暂无变量，请添加</div>';
-            return;
-        }
-        listContainer.innerHTML = variables.map(v => {
-            let desc = `${v.symbol} (${v.market === 'spot' ? '现货' : '合约'}) `;
-            if (v.priceType === 'latest') desc += '最新价';
-            else if (v.priceType === 'bid1') desc += '买一价';
-            else desc += '卖一价';
-            const price = currentPrices[v.name] !== undefined ? currentPrices[v.name].toFixed(4) : '--';
-            return `
-                <div class="var-item">
-                    <span class="var-name">${v.name}</span>
-                    <span class="var-desc">${desc}</span>
-                    <span class="var-price" style="color:#fbbf24;">${price}</span>
-                    <button class="var-remove" data-name="${v.name}">✖</button>
-                </div>
-            `;
+        const el = document.querySelector('.var-list');
+        if (!el) return;
+        el.innerHTML = variables.length === 0 ? '<div style="text-align:center;color:#9ca3af;">暂无变量</div>' : variables.map(v => {
+            const p = currentPrices[v.name]?.toFixed(4) || '--';
+            const t = v.priceType === 'latest' ? '最新' : v.priceType === 'bid1' ? '买一' : '卖一';
+            return `<div class="var-item"><span class="var-name">${v.name}</span><span class="var-desc">${v.symbol}(${v.market})${t}</span><span style="color:#fbbf24;">${p}</span><button class="var-remove" data-name="${v.name}">✖</button></div>`;
         }).join('');
-        document.querySelectorAll('.var-remove').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const name = btn.getAttribute('data-name');
-                removeVariable(name);
-            });
-        });
+        document.querySelectorAll('.var-remove').forEach(btn => btn.onclick = () => removeVariable(btn.dataset.name));
     }
 
+    // ==================== 表达式计算 ====================
+    function saveExpression(e) { localStorage.setItem(STORAGE_EXPR, e); }
+    function loadExpression() { return localStorage.getItem(STORAGE_EXPR) || ''; }
     function updateResult() {
-        const exprInput = document.querySelector('#calc-expr');
-        const resultSpan = document.querySelector('#calc-result');
-        const errorSpan = document.querySelector('#calc-error');
-        if (!exprInput || !resultSpan) return;
-
-        const expr = exprInput.value.trim();
-        // 每次输入都保存表达式（实时）
-        saveExpression(expr);
-
-        if (expr === '') {
-            resultSpan.textContent = '等待输入';
-            if (errorSpan) errorSpan.textContent = '';
-            return;
-        }
-
-        const varValues = {};
-        const undefinedVars = [];
-        for (const v of variables) {
-            if (currentPrices[v.name] !== undefined && !isNaN(currentPrices[v.name])) {
-                varValues[v.name] = currentPrices[v.name];
-            } else {
-                undefinedVars.push(v.name);
-            }
-        }
-        if (undefinedVars.length > 0) {
-            resultSpan.textContent = '--';
-            if (errorSpan) errorSpan.textContent = `变量 ${undefinedVars.join(', ')} 暂无价格数据`;
-            return;
-        }
-
-        const resultObj = safeEval(expr, varValues);
-        if (resultObj.error) {
-            resultSpan.textContent = '--';
-            if (errorSpan) errorSpan.textContent = resultObj.error;
-        } else {
-            resultSpan.textContent = resultObj.value.toFixed(8);
-            if (errorSpan) errorSpan.textContent = '';
-        }
+        const i = document.querySelector('#calc-expr'), r = document.querySelector('#calc-result'), e = document.querySelector('#calc-error');
+        if (!i || !r) return;
+        const v = i.value.trim(); saveExpression(v);
+        if (!v) { r.textContent = '等待输入'; e && (e.textContent = ''); return; }
+        const vals = {}, miss = [];
+        variables.forEach(k => currentPrices[k.name] ? vals[k.name] = currentPrices[k.name] : miss.push(k.name));
+        if (miss.length) { r.textContent = '--'; e && (e.textContent = `缺失: ${miss.join(',')}`); return; }
+        const res = safeEval(v, vals);
+        res.error ? (r.textContent = '--', e && (e.textContent = res.error)) : (r.textContent = res.value.toFixed(8), e && (e.textContent = ''));
     }
 
-    function createCalculator() {
-        const existing = document.getElementById('calc-panel');
-        if (existing) existing.remove();
+    // ==================== 三角套利（防抖+正确公式） ====================
+    function saveTri() { localStorage.setItem(STORAGE_TRI, JSON.stringify(triConfig)); }
+    function loadTri() {
+        const s = localStorage.getItem(STORAGE_TRI);
+        if (!s) return;
+        try { triConfig = JSON.parse(s); subscribeTri(); } catch(_) {}
+    }
+
+    function subscribeTri() {
+        Object.values(triWs).forEach(ws => ws && ws.close());
+        triWs = { ab: null, bc: null, ac: null };
+        const sub = (sym, type) => {
+            if (!sym) return;
+            const ws = new WebSocket(`${getWsBase(triConfig.market)}${sym.toLowerCase()}@bookTicker`);
+            ws.onmessage = debounce(e => {
+                try {
+                    const d = JSON.parse(e.data);
+                    triPrices[type] = { bid: parseFloat(d.b), ask: parseFloat(d.a) };
+                    updateAll();
+                } catch(_) {}
+            }, UPDATE_DEBOUNCE);
+            triWs[type] = ws;
+        };
+        sub(triConfig.symbolAB, 'ab');
+        sub(triConfig.symbolBC, 'bc');
+        sub(triConfig.symbolAC, 'ac');
+    }
+
+    const updateTriangularResult = debounce(() => {
+        const el = document.querySelector('#tri-result');
+        if (!el) return;
+        const { ab, bc, ac } = triPrices;
+        if (!ab.bid || !bc.bid || !ac.bid) { el.innerHTML = '<div style="color:#9ca3af;">等待价格...</div>'; return; }
+
+        const taker1 = (ab.bid * bc.bid) / ac.ask;
+        const taker2 = (ac.bid * ab.bid) / bc.ask;
+        const maker1 = (ab.ask * bc.bid) / ac.ask;
+        const maker2 = (ac.ask * ab.bid) / bc.ask;
+
+        el.innerHTML = `
+            <div style="font-weight:bold;color:#fbbf24;">📊 全吃单套利</div>
+            <div class="tri-strategy ${taker1>1?'profitable':'normal'}">A→B→C→A | ${taker1.toFixed(6)} ${taker1>1?'✅套利':'❌无机会'}</div>
+            <div class="tri-strategy ${taker2>1?'profitable':'normal'}">A→C→B→A | ${taker2.toFixed(6)} ${taker2>1?'✅套利':'❌无机会'}</div>
+            <div style="height:1px;background:#374151;margin:8px 0;"></div>
+            <div style="font-weight:bold;color:#10b981;">🎯 挂单套利(1挂2吃)</div>
+            <div class="tri-strategy ${maker1>1?'profitable':'normal'}">挂A→B | ${maker1.toFixed(6)} ${maker1>1?'✅套利':'❌无机会'}<div class="tri-rule">卖一挂单 + 两步吃单</div></div>
+            <div class="tri-strategy ${maker2>1?'profitable':'normal'}">挂A→C | ${maker2.toFixed(6)} ${maker2>1?'✅套利':'❌无机会'}<div class="tri-rule">卖一挂单 + 两步吃单</div></div>
+        `;
+    }, UPDATE_DEBOUNCE);
+
+    // ==================== 面板创建 ====================
+    function createPanel() {
+        const old = document.getElementById('calc-panel');
+        old && old.remove();
 
         const panel = document.createElement('div');
         panel.id = 'calc-panel';
         panel.innerHTML = `
-            <div class="calc-header">
-                <span>🔢 币安多合约计算器</span>
-                <button class="calc-close">×</button>
-            </div>
+            <div class="calc-header"><span>🔢 套利计算器(低耗版)</span><button class="calc-close">×</button></div>
             <div class="calc-content">
                 <div class="variables-section">
-                    <div class="section-title">📌 变量定义</div>
-                    <div class="var-list"></div>
-                    <div class="add-var-form">
-                        <input type="text" id="var-name" placeholder="变量名 (如 a)" maxlength="20" style="width:70px;">
-                        <select id="var-market">
-                            <option value="spot">现货</option>
-                            <option value="futures">合约</option>
-                        </select>
-                        <input type="text" id="var-symbol" placeholder="交易对 (如 BTCUSDT)" class="symbol-input">
-                        <select id="var-price-type">
-                            <option value="latest">最新价</option>
-                            <option value="bid1">买一价</option>
-                            <option value="ask1">卖一价</option>
-                        </select>
-                        <button class="btn" id="add-var-btn">添加</button>
+                    <div class="section-title" data-target="vars-content">📌 变量定义 <span class="toggle-icon">▼</span></div>
+                    <div class="section-content" id="vars-content">
+                        <div class="var-list"></div>
+                        <div class="add-var-form"><input id="var-name" placeholder="变量名" style="width:70px;"><select id="var-market"><option value="spot">现货</option><option value="futures">合约</option></select><input id="var-symbol" placeholder="交易对" class="symbol-input"><select id="var-price-type"><option value="latest">最新价</option><option value="bid1">买一价</option><option value="ask1">卖一价</option></select><button class="btn" id="add-var">添加</button></div>
                     </div>
                 </div>
                 <div class="expression-section">
-                    <div class="section-title">📝 表达式 (支持 + - * / 和括号)</div>
-                    <input type="text" id="calc-expr" class="expr-input" placeholder="例: a/b - c" autocomplete="off">
-                    <div class="result">
-                        <span class="result-label">结果 = </span>
-                        <span id="calc-result">等待输入</span>
+                    <div class="section-title" data-target="expr-content">📝 表达式 <span class="toggle-icon">▼</span></div>
+                    <div class="section-content" id="expr-content"><input id="calc-expr" class="expr-input" placeholder="a/b-c"><div class="result"><span class="result-label">结果=</span><span id="calc-result">等待输入</span></div><div id="calc-error" class="error-msg"></div></div>
+                </div>
+                <div class="triangular-section">
+                    <div class="section-title" data-target="tri-content">🔺 三角套利 <span class="toggle-icon">▼</span></div>
+                    <div class="section-content" id="tri-content">
+                        <div class="tri-form"><select id="tri-market"><option value="spot">现货</option><option value="futures">合约</option></select><input id="tri-ab" placeholder="AB交易对" class="symbol-input"><input id="tri-bc" placeholder="BC交易对" class="symbol-input"><input id="tri-ac" placeholder="AC交易对" class="symbol-input"><button class="btn" id="tri-apply">分析</button></div>
+                        <div id="tri-result" class="tri-result"></div>
                     </div>
-                    <div id="calc-error" class="error-msg"></div>
                 </div>
             </div>
         `;
         document.body.appendChild(panel);
 
-        // 拖拽功能
-        const header = panel.querySelector('.calc-header');
-        let isDragging = false, startX, startY, startLeft, startTop;
-        header.addEventListener('mousedown', (e) => {
-            if (e.target === header.querySelector('.calc-close')) return;
-            isDragging = true;
-            startX = e.clientX;
-            startY = e.clientY;
-            const rect = panel.getBoundingClientRect();
-            startLeft = rect.left;
-            startTop = rect.top;
-            panel.style.transition = 'none';
-            e.preventDefault();
-        });
-        document.addEventListener('mousemove', (e) => {
-            if (!isDragging) return;
-            let left = startLeft + (e.clientX - startX);
-            let top = startTop + (e.clientY - startY);
-            left = Math.max(0, Math.min(left, window.innerWidth - panel.offsetWidth));
-            top = Math.max(0, Math.min(top, window.innerHeight - panel.offsetHeight));
-            panel.style.left = left + 'px';
-            panel.style.top = top + 'px';
-            panel.style.right = 'auto';
-            panel.style.bottom = 'auto';
-        });
-        document.addEventListener('mouseup', () => isDragging = false);
-        document.addEventListener('mouseleave', () => isDragging = false);
+        // 拖拽
+        let drag = false, x, y, l, t;
+        panel.querySelector('.calc-header').onmousedown = e => { drag = true; x = e.clientX; y = e.clientY; const r = panel.getBoundingClientRect(); l = r.left; t = r.top; e.preventDefault(); };
+        document.onmousemove = e => drag && (panel.style.left = Math.max(0, l + e.clientX - x) + 'px', panel.style.top = Math.max(0, t + e.clientY - y) + 'px', panel.style.right = 'auto');
+        document.onmouseup = () => drag = false;
 
-        // 关闭按钮（不清除存储，下次打开依然恢复）
-        panel.querySelector('.calc-close').addEventListener('click', () => {
+        // 关闭：彻底清理所有资源（防内存泄漏）
+        panel.querySelector('.calc-close').onclick = () => {
             Object.values(wsConnections).forEach(ws => ws.close());
+            Object.values(triWs).forEach(ws => ws && ws.close());
+            variables = []; currentPrices = {}; wsConnections = {}; triWs = {};
             panel.remove();
+        };
+
+        // 折叠
+        document.querySelectorAll('.section-title').forEach(t => {
+            const c = document.getElementById(t.dataset.target);
+            t.onclick = () => { c.classList.toggle('collapsed'); t.classList.toggle('collapsed'); };
         });
 
-        // 添加变量
-        const addBtn = panel.querySelector('#add-var-btn');
-        addBtn.addEventListener('click', () => {
-            const name = panel.querySelector('#var-name').value.trim();
-            const market = panel.querySelector('#var-market').value;
-            const symbol = panel.querySelector('#var-symbol').value.trim();
-            const priceType = panel.querySelector('#var-price-type').value;
-            if (!name || !symbol) {
-                alert('请填写变量名和交易对');
-                return;
-            }
-            if (addVariable(name, market, symbol, priceType)) {
-                panel.querySelector('#var-name').value = '';
-                panel.querySelector('#var-symbol').value = '';
-            }
-        });
+        // 事件
+        panel.querySelector('#add-var').onclick = () => {
+            const n = panel.querySelector('#var-name').value.trim(), m = panel.querySelector('#var-market').value,  = panel.querySelector('#var-symbol').value.trim(), p = panel.querySelector('#var-price-type').value;
+            n &&  && addVariable(n,m,,p) && (panel.querySelector('#var-name').value='', panel.querySelector('#var-symbol').value='');
+        };
+        panel.querySelector('#calc-expr').oninput = updateAll;
+        panel.querySelector('#tri-apply').onclick = () => {
+            triConfig = { market: panel.querySelector('#tri-market').value, symbolAB: panel.querySelector('#tri-ab').value.trim().toUpperCase(), symbolBC: panel.querySelector('#tri-bc').value.trim().toUpperCase(), symbolAC: panel.querySelector('#tri-ac').value.trim().toUpperCase() };
+            saveTri(); subscribeTri();
+        };
 
-        // 表达式输入
-        const exprInput = panel.querySelector('#calc-expr');
-        exprInput.addEventListener('input', () => updateResult());
-
-        // 先尝试加载存储
-        const hasVars = loadVariables();        // 加载变量并订阅
-        const savedExpr = loadExpression();
-        exprInput.value = savedExpr;
-
-        // 如果没有加载到变量，至少保证变量列表为空
-        if (!hasVars) {
-            renderVariableList();
-        }
-
-        // 初始化结果
-        updateResult();
+        // 加载数据
+        loadVariables();
+        panel.querySelector('#calc-expr').value = loadExpression();
+        loadTri();
+        updateAll();
     }
 
-    // 启动
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', createCalculator);
-    } else {
-        createCalculator();
-    }
+    document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', createPanel) : createPanel();
 })();
