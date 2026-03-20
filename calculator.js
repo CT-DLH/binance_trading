@@ -1,10 +1,11 @@
 // ==UserScript==
-// @name         币安多合约计算器 (bookTicker版)
+// @name         币安多合约计算器 (稳定调试版)
 // @namespace    https://binance.com
-// @version      1.2
-// @description  定义变量（现货/合约，最新价/买一/卖一），输入四则运算表达式，实时计算结果
+// @version      1.3
+// @description  定义变量（现货/合约，最新价/买一/卖一），输入四则运算表达式，实时计算结果，显示详细错误
 // @author       Custom
 // @match        *://*.binance.com/*
+// @match        *://*
 // @grant        GM_addStyle
 // @run-at       document-end
 // ==/UserScript==
@@ -129,6 +130,7 @@
             word-break: break-all;
         }
         .result-label { font-size: 11px; color: #9ca3af; margin-right: 6px; }
+        .error { color: #ef4444; }
     `);
 
     // ==================== 全局变量 ====================
@@ -140,7 +142,7 @@
         return market === 'spot' ? 'wss://stream.binance.com/ws/' : 'wss://fstream.binance.com/ws/';
     }
 
-    // 订阅单个变量（使用 bookTicker 获取买一/卖一）
+    // 订阅单个变量
     function subscribeVariable(varObj) {
         const key = varObj.name;
         if (wsConnections[key]) {
@@ -153,29 +155,24 @@
         if (varObj.priceType === 'latest') {
             streamName = `${symbolLower}@aggTrade`;
         } else if (varObj.priceType === 'bid1' || varObj.priceType === 'ask1') {
-            // 使用 bookTicker 流同时获取买一和卖一
             streamName = `${symbolLower}@bookTicker`;
         }
         const wsUrl = `${getWsBase(varObj.market)}${streamName}`;
-        console.log(`[计算器] 连接 ${wsUrl}`);
         const ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
-            console.log(`[计算器] ${varObj.name} 已连接`);
+            // 不输出控制台
         };
 
         ws.onmessage = (event) => {
-            console.log(`[计算器] ${varObj.name} 收到数据:`, event.data); // 调试用，稳定后可注释
             try {
                 const data = JSON.parse(event.data);
                 let price = null;
                 if (varObj.priceType === 'latest') {
                     if (data.p) price = parseFloat(data.p);
                 } else if (varObj.priceType === 'bid1') {
-                    // bookTicker 返回的 b 字段是买一价
                     if (data.b) price = parseFloat(data.b);
                 } else if (varObj.priceType === 'ask1') {
-                    // bookTicker 返回的 a 字段是卖一价
                     if (data.a) price = parseFloat(data.a);
                 }
                 if (price !== null && !isNaN(price)) {
@@ -184,16 +181,15 @@
                     updateResult();
                 }
             } catch(e) {
-                console.error(`[计算器] ${varObj.name} 解析数据出错`, e);
+                // 静默忽略解析错误
             }
         };
 
-        ws.onerror = (err) => {
-            console.error(`[计算器] ${varObj.name} 连接错误`, err);
+        ws.onerror = () => {
+            // 静默
         };
 
-        ws.onclose = (e) => {
-            console.log(`[计算器] ${varObj.name} 连接关闭, code=${e.code}`);
+        ws.onclose = () => {
             setTimeout(() => {
                 if (variables.some(v => v.name === varObj.name)) {
                     subscribeVariable(varObj);
@@ -273,7 +269,26 @@
         });
     }
 
+    // 计算表达式，返回结果或错误信息
     function evaluateExpression(expr) {
+        // 检查未定义的变量
+        const variableNames = variables.map(v => v.name);
+        const regexVar = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+        let match;
+        const usedVars = new Set();
+        while ((match = regexVar.exec(expr)) !== null) {
+            const varName = match[1];
+            // 排除数学函数或常量（如 NaN, Infinity, undefined 等）
+            if (!['NaN', 'Infinity', 'undefined', 'null', 'true', 'false'].includes(varName)) {
+                usedVars.add(varName);
+            }
+        }
+        for (let usedVar of usedVars) {
+            if (!variableNames.includes(usedVar)) {
+                return { error: `变量 "${usedVar}" 未定义` };
+            }
+        }
+
         let replacedExpr = expr;
         for (const v of variables) {
             const price = currentPrices[v.name];
@@ -281,16 +296,19 @@
                 const regex = new RegExp(`\\b${v.name}\\b`, 'g');
                 replacedExpr = replacedExpr.replace(regex, price);
             } else {
-                const regex = new RegExp(`\\b${v.name}\\b`, 'g');
-                replacedExpr = replacedExpr.replace(regex, 'NaN');
+                // 变量有定义但尚未收到价格，返回等待价格
+                return { error: `变量 "${v.name}" 等待价格数据` };
             }
         }
+
         try {
             const result = new Function('return (' + replacedExpr + ')')();
-            if (isNaN(result) || !isFinite(result)) return '无效表达式';
-            return result;
+            if (isNaN(result) || !isFinite(result)) {
+                return { error: '计算结果无效（可能除零或无穷大）' };
+            }
+            return { result };
         } catch(e) {
-            return '语法错误';
+            return { error: `表达式语法错误: ${e.message}` };
         }
     }
 
@@ -301,10 +319,17 @@
         const expr = exprInput.value.trim();
         if (expr === '') {
             resultSpan.textContent = '等待输入';
+            resultSpan.classList.remove('error');
             return;
         }
-        const result = evaluateExpression(expr);
-        resultSpan.textContent = typeof result === 'number' ? result.toFixed(8) : result;
+        const evalResult = evaluateExpression(expr);
+        if (evalResult.error) {
+            resultSpan.textContent = evalResult.error;
+            resultSpan.classList.add('error');
+        } else {
+            resultSpan.textContent = evalResult.result.toFixed(8);
+            resultSpan.classList.remove('error');
+        }
     }
 
     function createCalculator() {
